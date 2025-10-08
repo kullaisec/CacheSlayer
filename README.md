@@ -169,9 +169,21 @@ optional arguments:
     -   **Score**: 0.6×similarity + 0.3×(cache evidence) + 0.1×(status match).
         
     -   If score ≥ --threshold and similarity high, the payload is flagged vulnerable.
-        
+  
 
-<video controls src="Screen Recording 2025-10-08 at 12.44.44 PM.mov" title="working sample video"></video>
+
+
+
+
+https://github.com/user-attachments/assets/cc41276e-49c7-4904-8c6a-c753b5292599
+
+
+
+
+https://github.com/user-attachments/assets/e64bf5a7-fcc8-48d0-a6e3-629917635095
+
+
+
 
 5.  Save reports (JSON + DIFF HTML).
     
