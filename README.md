@@ -1,7 +1,7 @@
-# **cacheslayer**
+# 🐗🌊🔥⚔️⛩️ **CacheSlayer** 🐗🌊🔥⚔️⛩️
 
 
-**cacheslayer** — a professional Web Cache Deception (WCD) testing toolkit.
+**CacheSlayer** 炭治郎 — a professional Web Cache Deception (WCD) testing toolkit.
 
 Automates cache-priming (authenticated) → replay (unauthenticated) checks, scores candidate payloads, and produces JSON + DIFF-mode HTML reports showing leaked content (if any). Includes vendor heuristics for Cloudflare / Fastly / Akamai.
 
