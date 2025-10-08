@@ -52,7 +52,7 @@ The tool can surface sensitive user data; handle the outputs securely.
 
 Author
 ------
-Kullai × ChatGPT
+Kullai
 """
 
 # ============================================================================
