@@ -1,67 +1,90 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-web_cache_diff.py — Full-featured Web Cache Deception scanner (DIFF MODE)
-========================================================================
-This script automates testing for Web Cache Deception (WCD) vulnerabilities.
+cacheslayer / web_cache_diff.py
+================================
+A full-featured Web Cache Deception (WCD) scanner with DIFF-mode reporting.
 
-Primary flow:
- 1. Parse an authenticated curl command (or curl file) to get a victim request.
- 2. Execute the authenticated request (victim) to capture baseline response body & headers.
- 3. Generate a set of candidate payload URLs (file suffixes, delimiters, encoded traversal, dot-segments, odd extensions).
- 4. For each payload:
-    a. Prime the cache by requesting the payload as victim (with cookies/headers).
-    b. Wait a configurable time (prime-wait).
-    c. Request the same payload as attacker (no cookies/authorization).
-    d. Capture attacker response, compute similarity vs baseline and detect cache headers.
-    e. Optionally re-check a small number of times to catch delayed cache behaviour.
- 5. Score and flag high-confidence vulnerabilities.
- 6. Produce rich JSON and DIFF-mode HTML reports (side-by-side snippets + unified diff).
+WHAT THIS TOOL DOES
+-------------------
+1) Parses an authenticated curl command (or a file containing one).
+2) Sends that request to capture the authenticated "baseline" response body & headers.
+3) Generates a wide set of WCD candidate payload URLs:
+   - static-looking suffixes (e.g., .css, .js, images, etc.)
+   - PortSwigger delimiter set (plain + percent-encoded) appended to paths
+   - delimiter+suffix combos (e.g., ';test', '.test', '%2F..%2F')
+   - dot-segment & encoded slash variations
+   - odd extensions to tickle CDN classification
+   - optional "vendor-mode" (cloudflare|fastly|akamai) for targeted heuristics
+4) For each payload:
+   a) PRIMES the cache as a victim (using your cookies/headers)
+   b) waits a configurable time (--prime-wait)
+   c) requests the same URL as an attacker (no auth headers)
+   d) computes body similarity vs baseline, detects cache headers, calculates score
+   e) optionally RECHECKS (prime + attacker again) to account for slow cache HITs
+5) Scores & flags high-confidence WCD vulns (score >= threshold and "victim-like").
+6) Produces:
+   - JSON: machine-readable summary of all payloads & measurements
+   - HTML: NEW layout with collapsible per-payload panels, sticky summaries, filters,
+           side-by-side snippets, and unified diffs per vulnerability
 
-New features in this final version:
- - vendor-mode: cloudflare | fastly | akamai  (adds targeted payloads + priorities)
- - DIFF HTML report with per-payload snippet previews and unified diff
- - --verify-ssl flag to enable strict HTTPS cert checking (default: off for labs)
- - verbose comments & docstrings to help you understand and modify behaviour
+SCORING
+-------
+score = 0.6 * body_similarity + 0.3 * (cache evidence present ? 1 : 0)
+      + 0.1 * (status parity vs baseline ? 1 : 0)
 
-Usage examples:
-  python3 web_cache_diff.py --curl-file auth_curl.txt --vendor-mode cloudflare --threshold 0.6 --out report.json --html report.html
-  python3 web_cache_diff.py --curl "<curl ... >" --verify-ssl --html report.html
+DEPENDENCIES
+------------
+- Python 3.8+
+- requests
 
-Author: Kullai × ChatGPT
+USAGE EXAMPLES
+--------------
+  python3 web_cache_diff.py --curl-file auth_curl.txt --vendor-mode cloudflare \
+    --threshold 0.6 --rechecks 1 --out report.json --html report.html
+
+  python3 web_cache_diff.py --curl "<your curl line>" --html report.html --verify-ssl
+
+SECURITY & ETHICS
+-----------------
+Use this tool ONLY against systems you are explicitly authorized to test.
+The tool can surface sensitive user data; handle the outputs securely.
+
+Author
+------
+Kullai × ChatGPT
 """
 
-# ---------------------------
-# Standard imports
-# ---------------------------
+# ============================================================================
+# Imports
+# ============================================================================
 import argparse
 import difflib
 import hashlib
 import html
 import json
-import os
 import re
 import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import requests
 import urllib3
 
-# ---------------------------
-# Suppress noisy SSL warnings
-# ---------------------------
-# For lab testing and self-signed certs, we default to not verifying SSL.
-# This invocation suppresses the InsecureRequestWarning to keep console output clean.
+
+# ============================================================================
+# Global setup / SSL warnings
+# ============================================================================
+# We default to NOT verifying SSL (labs commonly use self-signed certs).
+# You can enable strict verification with --verify-ssl.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-# ---------------------------
-# Terminal color helpers
-# ---------------------------
+# ============================================================================
+# Console color helpers (pretty printing)
+# ============================================================================
 class C:
     RED = "\033[31m"
     GREEN = "\033[32m"
@@ -70,66 +93,95 @@ class C:
     BOLD = "\033[1m"
     RESET = "\033[0m"
 
+def c_ok(s): return f"{C.GREEN}{s}{C.RESET}"
+def c_warn(s): return f"{C.YELLOW}{s}{C.RESET}"
+def c_bad(s): return f"{C.RED}{s}{C.RESET}"
+def c_info(s): return f"{C.CYAN}{s}{C.RESET}"
+def c_head(s): return f"{C.BOLD}{s}{C.RESET}"
 
-def color_ok(s): return f"{C.GREEN}{s}{C.RESET}"
-def color_warn(s): return f"{C.YELLOW}{s}{C.RESET}"
-def color_bad(s): return f"{C.RED}{s}{C.RESET}"
-def color_info(s): return f"{C.CYAN}{s}{C.RESET}"
-def color_head(s): return f"{C.BOLD}{s}{C.RESET}"
 
-
-# ---------------------------
-# Default payload lists (base)
-# ---------------------------
-# These are the canonical payloads used in many WCD reports / labs.
+# ============================================================================
+# Payload families (base)
+# ============================================================================
+# 1) Static-like suffixes that often trigger CDN cache classification:
 BASE_FILE_SUFFIXES = [
     "attacker.jpg", "attacker.png", "attacker.css", "attacker.js",
     "attacker.txt", "attacker.webp", "index.html", "attacker.svg", "evil.json"
 ]
 
+# 2) Classic delimiter tricks used in WCD writeups and PortSwigger labs:
 BASE_DELIMS = [
     ";", ";test", ".test",
     "%2F..%2F", "%2F.%2F", "/..%2F",
     "%2E%2E%2F", "%5C..%5C", "..%2F", "%2F%2E%2E%2F"
 ]
 
+# 3) Dot-segment / traversal-like variants:
 BASE_DOTSEG = [
     "/../", "/%2E%2E/", "/a/../", "/a%2F..%2F"
 ]
 
+# 4) Odd/rare extensions (sometimes classified as static by CDNs):
 BASE_ODD_EXTS = [
     "file.avif", "file.webp", "file.x", "file.unknownext", "file.woff2"
 ]
 
-# ---------------------------
-# Vendor heuristics (profiles)
-# ---------------------------
-# Each vendor profile adds a few targeted payload variants and influences
-# which payloads we run first (in practice this increases hit rate).
+
+# ============================================================================
+# PortSwigger delimiter list (plain + percent-encoded)
+# ============================================================================
+# Source: PortSwigger Web Cache Deception delimiter lists.
+PORTSWIGGER_DELIMITERS = [
+    "!", '"', "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", ":",
+    ";", "<", "=", ">", "?", "@", "[", "\\", "]", "^", "_", "`", "{", "|", "}", "~"
+]
+
+PORTSWIGGER_ENCODED = [
+    "%21","%22","%23","%24","%25","%26","%27","%28","%29","%2A","%2B","%2C","%2D","%2E","%2F",
+    "%3A","%3B","%3C","%3D","%3E","%3F","%40","%5B","%5C","%5D","%5E","%5F","%60","%7B","%7C","%7D","%7E"
+]
+
+# We will prefer some delimiters earlier because they emulate "static-ish" paths:
+PREFERRED_DELIMS = [".", "-", "_", ";"]
+
+
+# ============================================================================
+# Vendor heuristics (Cloudflare, Fastly, Akamai)
+# ============================================================================
 VENDOR_PROFILES = {
     "cloudflare": {
-        "extensions": ["js", "css", "json", "ico", "jpg", "png"],
+        # common static-like extensions Cloudflare is eager to cache
+        "extensions": ["js", "css", "json", "ico", "jpg", "png", "svg", "webp"],
+        # path "patterns" that might influence caching / keying
         "patterns": ["?cf_cache=true", ";cdn-cache", "/.cf-assets/"],
-        "note": "Cloudflare often aggressively caches static extensions and may ignore some query strings."
+        "note": "Cloudflare aggressively caches static extensions and may downplay some query strings."
     },
     "fastly": {
-        "extensions": ["woff2", "svg", "txt", "json"],
+        "extensions": ["woff2", "svg", "txt", "json", "css", "js"],
         "patterns": [";version=1", ";v=1", "?fastly=1"],
-        "note": "Fastly historically can use semicolon parameters as cache key components."
+        "note": "Fastly commonly preserves semicolon params in cache keys."
     },
     "akamai": {
-        "extensions": ["html", "asp", "php"],
+        "extensions": ["html", "asp", "php", "css", "js"],
         "patterns": ["/..;/", "%2F..%2F", "/;jsessionid="],
-        "note": "Akamai edge rules sometimes normalize encoded slashes and dot-segments."
+        "note": "Akamai normalizations on encoded slashes and dot-segments can lead to mismatches."
     }
 }
 
-# ---------------------------
-# Data classes for structured data
-# ---------------------------
+
+# ============================================================================
+# Data structures
+# ============================================================================
 @dataclass
 class RequestSpec:
-    """Represents the parsed authenticated request the user supplied (victim)."""
+    """
+    Parsed request from a curl line:
+    - method (GET/POST/...)
+    - url (absolute, https://...)
+    - headers (dict)
+    - data (payload for POST/PUT if any)
+    - cookies (Cookie header value if supplied)
+    """
     method: str
     url: str
     headers: Dict[str, str] = field(default_factory=dict)
@@ -139,7 +191,12 @@ class RequestSpec:
 
 @dataclass
 class ResponseRecord:
-    """Compact record for storing a response and metadata we will compare."""
+    """
+    Compact record of a single HTTP response:
+    - url, status
+    - headers (lowercased)
+    - body (text), body_len, body_md5 (fingerprint)
+    """
     url: str
     status: int
     headers: Dict[str, str]
@@ -150,7 +207,20 @@ class ResponseRecord:
 
 @dataclass
 class PayloadResult:
-    """Result produced per tested payload."""
+    """
+    Result for a single tested payload URL:
+    - prime_status: victim prime (status code)
+    - attacker_status: unauthenticated replay (status code)
+    - similarity: body similarity vs baseline (0..1)
+    - score: heuristic score (0..1)
+    - cache_evidence: list of cache hints (Age, X-Cache, Cf-Cache-Status, Cache-Control:max-age>0)
+    - attacker_headers: normalized response headers from attacker run
+    - victim_like: bool (similarity high & status parity)
+    - notes: free-form (e.g., recheck attempts)
+    - attacker_body_len, attacker_body_md5
+    - preview_victim_snippet, preview_attacker_snippet
+    - unified_diff_html: unified diff (escaped HTML) for report
+    """
     payload_url: str
     prime_status: Optional[int] = None
     attacker_status: Optional[int] = None
@@ -164,34 +234,34 @@ class PayloadResult:
     attacker_body_md5: str = ""
     preview_victim_snippet: str = ""
     preview_attacker_snippet: str = ""
-    unified_diff_html: str = ""  # pre-rendered diff for HTML report
+    unified_diff_html: str = ""
 
 
-# ---------------------------
-# Utilities: curl parsing, hashing, similarity, headers
-# ---------------------------
+# ============================================================================
+# Utility functions
+# ============================================================================
 def normalize_curl(curl: str) -> str:
     """
-    Normalize zsh $'...' quoting into normal quotes. This helps when users copy
-    zsh-style curl lines that include $'...' constructs.
+    Convert zsh $'...' quoting into simple '...' to simplify tokenization.
     """
     return re.sub(r"\$'([^']*)'", r"'\1'", curl.strip())
 
 
 def parse_curl(curl: str) -> RequestSpec:
     """
-    Parse a typical single-line curl command into a RequestSpec.
-    This parser handles:
+    Lightweight curl parser for common cases:
       - -X / --request
       - -H / --header "Key: value"
-      - -d / --data
+      - -d / --data / --data-raw / --data-binary
       - -b / --cookie
-      - final URL (http/https)
-    It's intentionally simple but robust for typical use cases.
+      - URL
+    The parser is intentionally forgiving (best-effort) to handle most real-world curl lines.
     """
     s = normalize_curl(curl)
     if s.startswith("curl "):
         s = s[5:]
+
+    # Tokenize respecting quotes
     tokens = re.findall(r'''(?:"[^"]*"|'[^']*'|\S)+''', s)
     tokens = [t.strip('"').strip("'") for t in tokens]
 
@@ -216,7 +286,6 @@ def parse_curl(curl: str) -> RequestSpec:
                 k, v = h.split(":", 1)
                 headers[k.strip()] = v.strip()
         elif t.startswith("-H") and t != "-H":
-            # compact -H'Key: Value'
             h = t[2:]
             if ":" in h:
                 k, v = h.split(":", 1)
@@ -233,8 +302,8 @@ def parse_curl(curl: str) -> RequestSpec:
             url = t
         i += 1
 
-    # last-token fallback
     if not url:
+        # last-token fallback
         for t in reversed(tokens):
             if t.startswith("http://") or t.startswith("https://"):
                 url = t
@@ -243,7 +312,7 @@ def parse_curl(curl: str) -> RequestSpec:
     if not url:
         raise ValueError("Could not parse URL from provided curl.")
 
-    # prefer Cookie header if present
+    # prefer 'Cookie' header if present
     if "Cookie" in headers and not cookies:
         cookies = headers["Cookie"]
 
@@ -251,47 +320,55 @@ def parse_curl(curl: str) -> RequestSpec:
 
 
 def md5_of_text(s: str) -> str:
-    """Return MD5 hex digest of input string (used to fingerprint bodies)."""
+    """
+    MD5 fingerprint for quick comparisons (fine for this purpose).
+    """
     return hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def body_similarity(a: str, b: str) -> float:
-    """Simple sequence-based similarity score in [0..1]."""
+    """
+    0..1 similarity using difflib's SequenceMatcher (fast, robust).
+    """
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def lower_headers(h: Dict[str, str]) -> Dict[str, str]:
-    """Normalize header keys to lowercase for easier checks."""
+    """
+    Normalize header keys to lowercase for consistent lookups.
+    """
     return {k.lower(): v for k, v in h.items()}
 
 
 def detect_cache_headers(h: Dict[str, str]) -> List[str]:
     """
-    Look for common headers that indicate a cached response or caching policy.
-    We consider: Age, X-Cache, Cf-Cache-Status, Via, X-Edge-Cache, Cache-Control:max-age>0
+    Detect signs that a response came from cache or is cacheable:
+    - Age, X-Cache, CF-Cache-Status, Via, X-Edge-Cache, X-Cache-Hits
+    - Cache-Control: max-age>0 (and not max-age=0)
     """
-    evidence = []
+    ev = []
     for k, v in h.items():
         kl = k.lower()
         if kl in ("age", "x-cache", "cf-cache-status", "via", "x-edge-cache", "x-cache-hits"):
-            evidence.append(f"{kl}:{v}")
+            ev.append(f"{kl}:{v}")
         if kl == "cache-control" and "max-age" in v and not re.search(r"max-age=0\b", v):
-            evidence.append(f"{kl}:{v}")
-    return evidence
+            ev.append(f"{kl}:{v}")
+    return ev
 
 
-def preview_snippet(text: str, length: int = 320) -> str:
-    """Return a short, whitespace-normalized, HTML-escaped snippet for report preview."""
+def preview_snippet(text: str, length: int = 360) -> str:
+    """
+    Return a short, whitespace-normalized, HTML-escaped snippet for preview boxes.
+    """
     t = re.sub(r"\s+", " ", text).strip()
     if len(t) > length:
         t = t[:length] + "…"
     return html.escape(t, quote=True)
 
 
-def unified_diff_html(a: str, b: str, max_lines: int = 500) -> str:
+def unified_diff_html(a: str, b: str, max_lines: int = 800) -> str:
     """
-    Generate a small unified diff between two texts and return HTML-escaped preformatted content.
-    We escape HTML so it’s safe to embed in a page.
+    Produce a unified diff (victim → attacker) and return as HTML-escaped text.
     """
     a_lines = a.splitlines()
     b_lines = b.splitlines()
@@ -301,63 +378,101 @@ def unified_diff_html(a: str, b: str, max_lines: int = 500) -> str:
     return html.escape("\n".join(diff_lines))
 
 
-# ---------------------------
-# HTTP helper (requests wrapper)
-# ---------------------------
+# ============================================================================
+# HTTP wrapper (requests)
+# ============================================================================
 def do_request(session: requests.Session, method: str, url: str, headers: Dict[str, str] = None,
-               data=None, timeout: int = 20, verify_ssl: bool = False) -> Tuple[Optional[requests.Response], Dict[str, str]]:
+               data=None, timeout: int = 25, verify_ssl: bool = False) -> Tuple[Optional[requests.Response], Dict[str, str]]:
     """
-    Perform a request with error handling. Returns (response, normalized_headers).
-    If request fails, returns (None, {}).
+    Perform an HTTP request with error handling. Returns (response, normalized_headers).
+    If the request fails, returns (None, {}).
     """
     try:
         r = session.request(method=method, url=url, headers=headers, data=data,
                             allow_redirects=True, timeout=timeout, verify=verify_ssl)
         return r, lower_headers(r.headers)
     except Exception as e:
-        print(color_warn(f"[!] Request error for {url}: {e}"))
+        print(c_warn(f"[!] Request error for {url}: {e}"))
         return None, {}
 
 
-# ---------------------------
-# Payload generation (with vendor-mode)
-# ---------------------------
+# ============================================================================
+# Payload generation (enhanced with PortSwigger delimiters + vendor mode)
+# ============================================================================
 def generate_candidate_payloads(base_url: str, vendor: Optional[str] = None) -> List[str]:
     """
-    Produce a list of candidate payload URLs to test, based on the target base URL.
-    If vendor is provided and recognized, insert vendor-specific prioritized payloads.
+    Build a list of WCD candidate payload URLs.
+
+    Strategy (in order):
+      1) Append classic static suffixes to the base path.
+      2) Add "classic" delimiter tricks from public research.
+      3) Add dot-segment (encoded & decoded) patterns.
+      4) Integrate full PortSwigger delimiter list (plain + encoded).
+         - Preferred delimiters first: '.', '-', '_', ';'
+         - Then all remaining delimiters (both raw and %encoded)
+      5) Odd extensions
+      6) Vendor-mode augmentations (Cloudflare/Fastly/Akamai):
+         - prioritized attacker.{ext}
+         - tail patterns specific to vendor
+
+    NOTE: We deduplicate while preserving order, to keep the testing predictable.
     """
     base = base_url.rstrip("/")
     candidates: List[str] = []
 
-    # 1) Classic file suffixes appended
+    # -- 1) Classic static suffixes (good hit-rate in labs & real world)
     for s in BASE_FILE_SUFFIXES:
         candidates.append(f"{base}/{s}")
 
-    # 2) Delimiter fuzz (common WCD trick variants)
+    # -- 2) Classic delimiter variants seen in WCD posts/labs
     for d in BASE_DELIMS:
         candidates.append(f"{base}{d}")
         candidates.append(f"{base}{d}/")
 
-    # 3) Dot-segment permutations
+    # -- 3) Dot-segment permutations (origin vs cache normalization mismatch)
     for ds in BASE_DOTSEG:
         candidates.append(f"{base}{ds}")
+        # combine a common static suffix behind dot-segment
+        candidates.append(f"{base}{ds}attacker.css")
 
-    # 4) Odd extensions to target CDN heuristics
+    # -- 4) PortSwigger delimiter set (prioritize preferred first)
+    for d in PREFERRED_DELIMS:
+        candidates.append(f"{base}{d}")
+        candidates.append(f"{base}{d}test")
+        candidates.append(f"{base}{d}attacker.css")
+        candidates.append(f"{base}{d}/")
+
+    # The full list (plain+encoded). Skip preferred duplicates.
+    for plain, enc in zip(PORTSWIGGER_DELIMITERS, PORTSWIGGER_ENCODED):
+        if plain in PREFERRED_DELIMS:
+            continue
+        # Append raw (where allowed by requests) and encoded forms.
+        # Some raw characters like '#' or '?' would change URL semantics; the encoded variant is safe.
+        try:
+            candidates.append(f"{base}{plain}")
+            candidates.append(f"{base}{plain}test")
+        except Exception:
+            # If creating that string raises (rare), just ignore raw version.
+            pass
+        candidates.append(f"{base}{enc}")
+        candidates.append(f"{base}{enc}test")
+        candidates.append(f"{base}{enc}/")
+
+    # -- 5) Odd extensions to poke CDN mime/static heuristics
     for e in BASE_ODD_EXTS:
         candidates.append(f"{base}/{e}")
 
-    # 5) Vendor-specific augmentation
+    # -- 6) Vendor-specific augmentations
     if vendor and vendor in VENDOR_PROFILES:
         profile = VENDOR_PROFILES[vendor]
-        # Add extension-focused payloads first (higher priority)
+        # Prepend attacker.{ext} prioritized variants
         for ext in profile.get("extensions", []):
             candidates.insert(0, f"{base}/attacker.{ext}")
-        # Add pattern-based payloads
+        # Tail patterns appended
         for pat in profile.get("patterns", []):
             candidates.append(f"{base}{pat}")
 
-    # Deduplicate while preserving order
+    # Final: dedupe while preserving order
     seen = set()
     final = []
     for u in candidates:
@@ -367,16 +482,12 @@ def generate_candidate_payloads(base_url: str, vendor: Optional[str] = None) -> 
     return final
 
 
-# ---------------------------
-# Core scanner class
-# ---------------------------
+# ============================================================================
+# Scanner core
+# ============================================================================
 class WCDScanner:
     """
-    Encapsulates the scanner state and logic:
-      - Holds sessions for victim (with auth headers/cookies) and attacker (stripped headers)
-      - Captures baseline
-      - Tests each payload (prime + attack) with rechecks
-      - Produces PayloadResult objects
+    Orchestrates victim/attacker sessions, baseline capture, and payload testing.
     """
 
     def __init__(self, req: RequestSpec, verify_ssl: bool = False,
@@ -389,64 +500,76 @@ class WCDScanner:
         self.recheck_wait = recheck_wait
         self.threshold = threshold
 
-        # sessions
+        # Victim session: includes cookies/headers from the provided curl
         self.victim_session = requests.Session()
-        self.attacker_session = requests.Session()
-
-        # victim session should include cookies/headers from the parsed curl
         if self.req.cookies:
             self.victim_session.headers.update({"Cookie": self.req.cookies})
         if self.req.headers:
-            # merge headers into victim session
             self.victim_session.headers.update(self.req.headers)
 
-        # attacker headers: copy victim headers but remove auth-related fields
-        attacker_h = deepcopy(self.req.headers)
-        for k in list(attacker_h.keys()):
+        # Attacker session: copy headers but strip auth/cookie
+        self.attacker_session = requests.Session()
+        attacker_headers = deepcopy(self.req.headers)
+        for k in list(attacker_headers.keys()):
             if k.lower() in ("cookie", "authorization", "x-auth-token"):
-                attacker_h.pop(k)
-        self.attacker_headers = attacker_h
+                attacker_headers.pop(k)
+        self.attacker_headers = attacker_headers
 
+    # -----------------------------------------
     def capture_baseline(self) -> ResponseRecord:
-        """Execute the authenticated (victim) request and return baseline ResponseRecord."""
-        print(color_info("[*] Capturing baseline (authenticated) response..."))
+        """
+        Execute the authenticated (victim) request and store the baseline.
+        """
+        print(c_info("[*] Capturing baseline (authenticated) response..."))
         r, h = do_request(self.victim_session, self.req.method, self.req.url,
                           headers=self.req.headers, data=self.req.data, verify_ssl=self.verify_ssl)
         if not r:
-            raise SystemExit(color_bad("[-] Failed to fetch baseline. Aborting."))
+            raise SystemExit(c_bad("[-] Failed to fetch baseline. Aborting."))
         body = r.text
-        rec = ResponseRecord(url=self.req.url, status=r.status_code, headers=h,
-                             body=body, body_len=len(body), body_md5=md5_of_text(body))
-        print(color_ok(f"[+] Baseline captured: status={rec.status} len={rec.body_len} md5={rec.body_md5}"))
+        rec = ResponseRecord(
+            url=self.req.url,
+            status=r.status_code,
+            headers=h,
+            body=body,
+            body_len=len(body),
+            body_md5=md5_of_text(body)
+        )
+        print(c_ok(f"[+] Baseline captured: status={rec.status} len={rec.body_len} md5={rec.body_md5}"))
         return rec
 
+    # -----------------------------------------
     def test_payload_once(self, payload_url: str, baseline: ResponseRecord) -> PayloadResult:
         """
-        Perform a single priming (victim) + attacker replay, compute similarity & evidence,
-        and return a PayloadResult. This function does not perform rechecks.
+        Single-cycle test for one payload:
+        - prime as victim
+        - pause
+        - request as attacker
+        - compute similarity, cache evidence, and score
         """
-        pr_notes = []
-        # Prime the cache as the victim (with auth)
-        print(color_info(f"    [>] Priming as victim: {payload_url}"))
+        notes: List[str] = []
+
+        # Prime phase (victim)
+        print(c_info(f"    [>] Priming as victim: {payload_url}"))
         rp, _ = do_request(self.victim_session, "GET", payload_url, headers=self.req.headers, verify_ssl=self.verify_ssl)
         prime_status = rp.status_code if rp else None
-        pr_notes.append(f"prime_status={prime_status}")
+        notes.append(f"prime_status={prime_status}")
 
-        # Wait a small time to allow caches to process the primed object
+        # Give time for caches to ingest the object
         if self.prime_wait > 0:
             time.sleep(self.prime_wait)
 
-        # Attacker request (no auth)
-        print(color_info(f"    [>] Attacker request (no auth): {payload_url}"))
+        # Attacker phase
+        print(c_info(f"    [>] Attacker request (no auth): {payload_url}"))
         ra, ha = do_request(self.attacker_session, "GET", payload_url, headers=self.attacker_headers, verify_ssl=self.verify_ssl)
         if not ra:
-            return PayloadResult(payload_url=payload_url, prime_status=prime_status, attacker_status=None, notes=pr_notes)
+            return PayloadResult(payload_url=payload_url, prime_status=prime_status, attacker_status=None, notes=notes)
 
+        # Compare bodies & detect cache
         attacker_body = ra.text
         similarity = body_similarity(baseline.body, attacker_body)
         cache_evd = detect_cache_headers(ha)
 
-        # scoring: combine similarity (0.6) + cache evidence (0.3) + status parity (0.1)
+        # Heuristic score
         score = 0.6 * similarity
         if cache_evd:
             score += 0.3
@@ -456,10 +579,10 @@ class WCDScanner:
 
         victim_like = (similarity >= 0.6 and ra.status_code == baseline.status)
 
-        # snippet previews and unified diff for HTML report
-        v_prev = preview_snippet(baseline.body, length=500)
-        a_prev = preview_snippet(attacker_body, length=500)
-        u_diff = unified_diff_html(baseline.body, attacker_body, max_lines=800)
+        # Snippets + diff for HTML
+        v_prev = preview_snippet(baseline.body, length=520)
+        a_prev = preview_snippet(attacker_body, length=520)
+        u_diff = unified_diff_html(baseline.body, attacker_body, max_lines=900)
 
         return PayloadResult(
             payload_url=payload_url,
@@ -470,7 +593,7 @@ class WCDScanner:
             cache_evidence=cache_evd,
             attacker_headers=ha,
             victim_like=victim_like,
-            notes=pr_notes,
+            notes=notes,
             attacker_body_len=len(attacker_body),
             attacker_body_md5=md5_of_text(attacker_body),
             preview_victim_snippet=v_prev,
@@ -478,205 +601,322 @@ class WCDScanner:
             unified_diff_html=u_diff
         )
 
+    # -----------------------------------------
     def test_payload_with_rechecks(self, payload_url: str, baseline: ResponseRecord) -> PayloadResult:
         """
-        Run initial priming + attacker check and optionally recheck (useful when caches
-        require multiple requests/time to be populated). Returns the final PayloadResult.
+        Perform the test once and then retry if inconclusive (score<threshold or no cache evidence),
+        because some caching layers need an extra round before hits are visible.
         """
         result = self.test_payload_once(payload_url, baseline)
         tries = self.rechecks
         while tries > 0 and (result.score < self.threshold or not result.cache_evidence):
-            # Re-check: prime again and re-run attacker request
-            print(color_warn(f"    [~] Inconclusive (score={result.score} cache={result.cache_evidence}); recheck in {self.recheck_wait}s..."))
+            print(c_warn(f"    [~] Inconclusive (score={result.score}, cache={bool(result.cache_evidence)}). Recheck in {self.recheck_wait:.1f}s..."))
             time.sleep(self.recheck_wait)
             result = self.test_payload_once(payload_url, baseline)
             tries -= 1
         return result
 
 
-# ---------------------------
-# HTML report generator (DIFF MODE)
-# ---------------------------
+# ============================================================================
+# HTML report (NEW layout: collapsible panels, sticky header, filtering)
+# ============================================================================
 def write_html_report(path: str, baseline: ResponseRecord, results: List[PayloadResult], threshold: float):
     """
-    Create a detailed HTML report that includes:
-      - baseline metadata
-      - table of tested payloads with summary scores and cache evidence
-      - for each flagged result, an expandable diff (victim vs attacker) plus snippets
-    The report is intentionally styled dark and uses preformatted blocks for diffs.
-    """
-    # Simple CSS for the report
-    css = """
-    body { background:#0b1220; color:#e6eef6; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; padding:20px; }
-    h1 { color:#93c5fd; }
-    table { width:100%; border-collapse:collapse; margin-top:12px; }
-    th, td { padding:8px 10px; border-bottom:1px solid #1f2937; text-align:left; vertical-align:top; }
-    th { color:#9ca3af; font-weight:600; }
-    code { color:#fbbf24; font-family: monospace; font-size:0.95em; }
-    .card { background:#071025; border:1px solid #112137; padding:12px; border-radius:8px; margin-bottom:12px; }
-    .vuln { border-left:4px solid #dc2626; padding-left:8px; margin-bottom:10px; }
-    .ok { border-left:4px solid #16a34a; padding-left:8px; margin-bottom:10px; }
-    pre { background:#071124; padding:10px; border-radius:6px; color:#e6eef6; overflow:auto; }
-    details summary { cursor:pointer; color:#60a5fa; margin-bottom:6px; }
-    """
+    Generate a polished HTML report with:
+      - Sticky summary header (target, totals, threshold)
+      - Filter/search box for quick triage
+      - Collapsible per-payload panels (status, headers, cache evidence, body snippets)
+      - For flagged vulnerabilities: highlighted "VULNERABLE" badge and unified diff
 
-    # Build the table rows
-    rows_html = []
-    flagged_html = []  # detailed diffs for flagged vulns
-    for r in results:
+    All content is rendered client-side (lightweight JS) — no external dependencies.
+    """
+    # Small helper: stringify a header dict as HTML list
+    def headers_to_html(h: Dict[str, str]) -> str:
+        if not h:
+            return "<em>None</em>"
+        items = "".join(f"<li><code>{html.escape(k)}</code>: {html.escape(str(v))}</li>" for k, v in h.items())
+        return f"<ul class='kv'>{items}</ul>"
+
+    # Count stats
+    total = len(results)
+    flagged = [r for r in results if r.score >= threshold and r.victim_like]
+    flagged_count = len(flagged)
+
+    # CSS (dark, clean)
+    css = r"""
+:root {
+  --bg: #0b1220;
+  --card: #0a1428;
+  --muted: #9ca3af;
+  --text: #e6eef6;
+  --accent: #60a5fa;
+  --good: #16a34a;
+  --bad: #dc2626;
+  --warn: #f59e0b;
+  --code: #fbbf24;
+  --line: #1f2937;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial}
+a{color:var(--accent);text-decoration:none}
+h1,h2{margin:0 0 12px 0}
+.container{padding:20px;max-width:1200px;margin:0 auto}
+.sticky{
+  position:sticky; top:0; z-index:50; backdrop-filter: blur(6px);
+  background: linear-gradient(180deg, rgba(11,18,32,0.95), rgba(11,18,32,0.6));
+  border-bottom:1px solid var(--line);
+}
+.header-grid{display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:center;padding:12px 20px}
+h1.title{color:#93c5fd;font-size:20px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.kv{margin:6px 0 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:12px 0}
+.vuln{border-left:4px solid var(--bad)}
+.ok{border-left:4px solid var(--good)}
+table{width:100%;border-collapse:collapse}
+th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+code{color:var(--code);font-size:0.95em}
+pre{background:#071124;padding:10px;border-radius:8px;overflow:auto;color:var(--text)}
+details{border:1px solid var(--line);border-radius:8px}
+details>summary{cursor:pointer;list-style:none;padding:10px 12px;outline:none}
+details>summary::-webkit-details-marker{display:none}
+summary .status{font-weight:700}
+summary .url{word-break:break-all}
+.fRight{float:right;color:var(--muted);font-size:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+input[type="search"]{background:#0e1a33;border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;min-width:260px}
+.btn{background:#0e1a33;border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;cursor:pointer}
+.btn:hover{border-color:#294167}
+.small{font-size:12px;color:var(--muted)}
+.copy{cursor:pointer;border:1px dashed var(--line);padding:2px 6px;border-radius:6px}
+"""
+
+    # Tiny JS for filtering + copy
+    js = r"""
+function filterRows() {
+  const q = document.getElementById('q').value.toLowerCase();
+  const onlyVuln = document.getElementById('onlyVuln').checked;
+  const threshold = parseFloat(document.getElementById('thresholdVal').dataset.th);
+  const panels = document.querySelectorAll('.payload');
+  let shown=0;
+  panels.forEach(p => {
+    const url = p.dataset.url.toLowerCase();
+    const score = parseFloat(p.dataset.score);
+    const victimlike = (p.dataset.victimlike === 'true');
+    let ok = true;
+    if (q && !url.includes(q)) ok = false;
+    if (onlyVuln && !(score >= threshold && victimlike)) ok = false;
+    p.style.display = ok ? '' : 'none';
+    if (ok) shown++;
+  });
+  document.getElementById('shownCount').textContent = shown;
+}
+
+function copyText(txt) {
+  navigator.clipboard.writeText(txt).then(()=>{ alert('Copied!'); });
+}
+"""
+
+    # Build payload panels
+    panels_html = []
+    for idx, r in enumerate(results, 1):
         ev = ", ".join(r.cache_evidence) if r.cache_evidence else "—"
-        vuln = r.score >= threshold and r.victim_like
-        status_class = "vuln" if vuln else "ok"
-        rows_html.append(f"""
-        <tr class="{status_class}">
-          <td><code>{html.escape(r.payload_url)}</code></td>
-          <td style="text-align:center">{r.prime_status or '-'}</td>
-          <td style="text-align:center">{r.attacker_status or '-'}</td>
-          <td style="text-align:right">{r.similarity:.3f}</td>
-          <td style="text-align:right">{r.score:.3f}</td>
-          <td>{html.escape(ev)}</td>
-        </tr>
-        """)
-        if vuln:
-            # create detailed diff card
-            flagged_html.append(f"""
-            <div class="card vuln">
-              <div style="display:flex;justify-content:space-between;align-items:center;">
-                <div><strong>VULNERABLE:</strong> <code>{html.escape(r.payload_url)}</code></div>
-                <div style="color:#9ca3af">score={r.score:.3f} sim={r.similarity:.3f}</div>
-              </div>
-              <div style="margin-top:8px;color:#9ca3af">Cache evidence: {html.escape(', '.join(r.cache_evidence) or 'none')}</div>
-              <details style="margin-top:8px">
-                <summary>View snippets & diff</summary>
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px">
-                  <div>
-                    <div style="font-weight:600;margin-bottom:4px">Victim snippet</div>
-                    <pre>{r.preview_victim_snippet}</pre>
-                  </div>
-                  <div>
-                    <div style="font-weight:600;margin-bottom:4px">Attacker snippet</div>
-                    <pre>{r.preview_attacker_snippet}</pre>
-                  </div>
-                </div>
-                <div style="margin-top:8px">
-                  <div style="font-weight:600;margin-bottom:4px">Unified diff (victim → attacker)</div>
-                  <pre>{r.unified_diff_html}</pre>
-                </div>
-              </details>
-            </div>
-            """)
+        vuln = (r.score >= threshold and r.victim_like)
+        klass = "vuln" if vuln else "ok"
+        status = "VULNERABLE" if vuln else "OK/Noisy"
+        icon = "⚠️" if vuln else "✅"
 
-    # Put together the final HTML
-    html_doc = f"""<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>WCD DIFF Report</title><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{css}</style></head>
-<body>
-  <h1>Web Cache Deception — DIFF Report</h1>
-  <div class="card">
-    <div><b>Baseline URL:</b> <code>{html.escape(baseline.url)}</code></div>
-    <div style="margin-top:6px"><b>Baseline status:</b> {baseline.status} &nbsp; <b>body MD5:</b> {baseline.body_md5} &nbsp; <b>len:</b> {baseline.body_len}</div>
+        # headers
+        attk_headers_html = headers_to_html(r.attacker_headers)
+
+        # per-payload panel
+        panels_html.append(f"""
+<details class="card payload {klass}" data-url="{html.escape(r.payload_url)}"
+         data-score="{r.score:.3f}" data-victimlike="{str(r.victim_like).lower()}" open>
+  <summary>
+    <span class="status">{icon} {status}</span>
+    &nbsp; <code class="url">{html.escape(r.payload_url)}</code>
+    <span class="fRight small">score={r.score:.3f} • sim={r.similarity:.3f} • prime={r.prime_status or '-'} • atk={r.attacker_status or '-'}</span>
+  </summary>
+
+  <div class="row small" style="margin:6px 0 8px 0">
+    <span class="badge">cache: {html.escape(ev)}</span>
+    <span class="badge">victim-like: {str(r.victim_like).lower()}</span>
+    <span class="badge">md5: {r.attacker_body_md5}</span>
+    <span class="badge">len: {r.attacker_body_len}</span>
   </div>
 
-  <h2>Flagged Vulnerabilities</h2>
-  {"".join(flagged_html) if flagged_html else "<div class='card'>No high-confidence vulnerabilities found at the configured threshold.</div>"}
+  <div class="grid2">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div><b>Victim snippet</b></div>
+        <div class="copy" onclick="copyText(this.parentNode.parentNode.nextElementSibling.textContent)">copy</div>
+      </div>
+      <pre>{r.preview_victim_snippet}</pre>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;align-items:center">
+        <div><b>Attacker snippet</b></div>
+        <div class="copy" onclick="copyText(this.parentNode.parentNode.nextElementSibling.textContent)">copy</div>
+      </div>
+      <pre>{r.preview_attacker_snippet}</pre>
+    </div>
+  </div>
 
-  <h2>All tested payloads</h2>
-  <table>
-    <thead><tr><th>Payload URL</th><th>Prime</th><th>Attacker</th><th>Sim</th><th>Score</th><th>Cache Evidence</th></tr></thead>
-    <tbody>
-      {''.join(rows_html)}
-    </tbody>
-  </table>
+  <div class="card">
+    <b>Attacker response headers</b>
+    {attk_headers_html}
+  </div>
 
-  <p style="color:#9ca3af;margin-top:18px">Scoring formula: <code>0.6×similarity + 0.3×(cache evidence present) + 0.1×status parity</code>. Threshold={threshold:.2f}</p>
-</body>
-</html>
+  <div class="card">
+    <b>Unified diff (victim → attacker)</b>
+    <pre>{r.unified_diff_html}</pre>
+  </div>
+</details>
+""")
+
+    # Summary header
+    header_html = f"""
+<div class="sticky">
+  <div class="header-grid">
+    <div>
+      <h1 class="title">cacheslayer — Web Cache Deception report</h1>
+      <div class="small">Target: <code>{html.escape(baseline.url)}</code></div>
+    </div>
+    <div class="filters">
+      <input id="q" type="search" placeholder="Filter by URL…" oninput="filterRows()">
+      <label class="row small" style="gap:6px">
+        <input id="onlyVuln" type="checkbox" onchange="filterRows()"> Only vulnerabilities
+      </label>
+      <span id="thresholdVal" class="badge" data-th="{threshold:.2f}">threshold: {threshold:.2f}</span>
+      <span class="badge">baseline: {baseline.status} • md5: {baseline.body_md5}</span>
+    </div>
+    <div class="row">
+      <span class="badge">flagged: {flagged_count}</span>
+      <span class="badge">total: {total}</span>
+      <span class="badge">shown: <span id="shownCount">{total}</span></span>
+    </div>
+  </div>
+</div>
 """
+
+    # Assemble final HTML
+    doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>cacheslayer — WCD report</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>{css}</style>
+</head>
+<body>
+  {header_html}
+  <div class="container">
+    {"".join(panels_html) if panels_html else "<div class='card'>No results.</div>"}
+    <div class="card small">
+      Scoring: <code>0.6×similarity + 0.3×cache evidence + 0.1×status parity</code>.
+      A payload is flagged when <code>score ≥ threshold</code> and <code>victim_like = true</code>.
+    </div>
+  </div>
+  <script>{js}</script>
+</body>
+</html>"""
+
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(html_doc)
+        fh.write(doc)
 
 
-# ---------------------------
-# Main CLI and orchestrator
-# ---------------------------
+# ============================================================================
+# CLI orchestrator
+# ============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="WCD DIFF scanner (full-featured).")
+    parser = argparse.ArgumentParser(
+        description="cacheslayer — Web Cache Deception scanner (DIFF mode, new HTML layout)"
+    )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--curl", help="The authenticated curl command (single-line).")
     src.add_argument("--curl-file", help="Path to a file containing the authenticated curl command.")
-    parser.add_argument("--vendor-mode", choices=list(VENDOR_PROFILES.keys()), help="Enable vendor-specific heuristics.")
-    parser.add_argument("--prime-wait", type=float, default=5.0, help="Seconds to wait after priming (default: 5).")
-    parser.add_argument("--rechecks", type=int, default=1, help="Number of rechecks if inconclusive (default: 1).")
-    parser.add_argument("--recheck-wait", type=float, default=5.0, help="Seconds to wait between rechecks (default: 5).")
-    parser.add_argument("--threshold", type=float, default=0.7, help="Score threshold for vulnerability (0..1).")
-    parser.add_argument("--verify-ssl", action="store_true", help="Enable strict SSL certificate verification.")
+
+    parser.add_argument("--vendor-mode", choices=list(VENDOR_PROFILES.keys()),
+                        help="Enable vendor-specific heuristics: cloudflare | fastly | akamai.")
+    parser.add_argument("--prime-wait", type=float, default=5.0,
+                        help="Seconds to wait after priming (default: 5).")
+    parser.add_argument("--rechecks", type=int, default=1,
+                        help="Number of rechecks if inconclusive (default: 1).")
+    parser.add_argument("--recheck-wait", type=float, default=5.0,
+                        help="Seconds to wait between rechecks (default: 5).")
+    parser.add_argument("--threshold", type=float, default=0.7,
+                        help="Score threshold for vulnerability (0..1). Default: 0.7")
+    parser.add_argument("--verify-ssl", action="store_true",
+                        help="Enable strict SSL certificate verification (default: off).")
     parser.add_argument("--out", help="Write JSON report to this path.")
-    parser.add_argument("--html", help="Write DIFF HTML report to this path.")
+    parser.add_argument("--html", help="Write HTML report (new layout) to this path.")
+
     args = parser.parse_args()
 
-    print(color_head("== Web Cache Deception (DIFF) Scanner =="))
-    print(color_warn("[!] ONLY run this tool against systems you are authorized to test.\n"))
+    print(c_head("== cacheslayer: Web Cache Deception (DIFF) =="))
+    print(c_warn("[!] ONLY run this tool against systems you are authorized to test.\n"))
 
-    # Read curl input
+    # Get curl content
     curl_text = args.curl if args.curl else open(args.curl_file, "r", encoding="utf-8").read().strip()
 
-    # Parse curl into RequestSpec
-    print(color_info("[*] Parsing curl command..."))
+    # Parse
+    print(c_info("[*] Parsing curl command..."))
     try:
         req = parse_curl(curl_text)
     except Exception as e:
-        print(color_bad(f"[!] Failed to parse curl: {e}"))
+        print(c_bad(f"[!] Failed to parse curl: {e}"))
         sys.exit(1)
-    print(color_ok(f"[+] Parsed: method={req.method} url={req.url}"))
+    print(c_ok(f"[+] Parsed: method={req.method} url={req.url}"))
 
-    # Confirm user has permission
-    if input(color_info("Type YES to confirm you are authorized to test this target: ")).strip() != "YES":
-        print(color_bad("Aborted by user."))
+    # Confirm authorization
+    if input(c_info("Type YES to confirm you are authorized to test this target: ")).strip() != "YES":
+        print(c_bad("[-] Aborted by user."))
         sys.exit(1)
 
-    # Create scanner instance
-    scanner = WCDScanner(req, verify_ssl=args.verify_ssl,
+    # Scanner
+    scanner = WCDScanner(req,
+                         verify_ssl=args.verify_ssl,
                          prime_wait=args.prime_wait,
                          rechecks=args.rechecks,
                          recheck_wait=args.recheck_wait,
                          threshold=args.threshold)
 
-    # Capture baseline (authenticated response)
+    # Baseline
     baseline = scanner.capture_baseline()
 
-    # Generate payloads (with optional vendor heuristics)
+    # Payloads
     payloads = generate_candidate_payloads(baseline.url, vendor=args.vendor_mode)
-    print(color_info(f"[*] Generated {len(payloads)} payload candidates (vendor_mode={args.vendor_mode})."))
+    print(c_info(f"[*] Generated {len(payloads)} candidate payloads (vendor_mode={args.vendor_mode})."))
 
     # Run tests
     results: List[PayloadResult] = []
     flagged: List[PayloadResult] = []
-    for p in payloads:
-        print(color_head(f"[•] Testing payload: {p}"))
-        res = scanner.test_payload_with_rechecks(p, baseline)
+    for purl in payloads:
+        print(c_head(f"[•] Testing payload: {purl}"))
+        res = scanner.test_payload_with_rechecks(purl, baseline)
         results.append(res)
-        # show concise console line
         ev = ", ".join(res.cache_evidence) if res.cache_evidence else "—"
-        status_str = f"prime={res.prime_status} attacker={res.attacker_status}"
+        status_str = f"prime={res.prime_status} atk={res.attacker_status}"
         if res.score >= args.threshold and res.victim_like:
-            print(color_bad(f"    [VULNERABLE] sim={res.similarity:.3f} score={res.score:.3f} cache=[{ev}] ({status_str})"))
+            print(c_bad(f"    [VULNERABLE] sim={res.similarity:.3f} score={res.score:.3f} cache=[{ev}] ({status_str})"))
             flagged.append(res)
         else:
-            print(color_warn(f"    [OK/NOISE]  sim={res.similarity:.3f} score={res.score:.3f} cache=[{ev}] ({status_str})"))
+            print(c_warn(f"    [OK/NOISE]  sim={res.similarity:.3f} score={res.score:.3f} cache=[{ev}] ({status_str})"))
 
     # Summary
-    print(color_head("\n=== SUMMARY ==="))
+    print(c_head("\n=== SUMMARY ==="))
     if flagged:
-        print(color_bad(f"[!] Found {len(flagged)} high-confidence vulnerable payload(s):"))
+        print(c_bad(f"[!] Found {len(flagged)} high-confidence vulnerable payload(s):"))
         for v in flagged:
-            print(color_bad(f"  -> {v.payload_url}  score={v.score:.3f} sim={v.similarity:.3f} cache={'; '.join(v.cache_evidence) or '—'}"))
+            print(c_bad(f"  -> {v.payload_url}  score={v.score:.3f} sim={v.similarity:.3f} cache={'; '.join(v.cache_evidence) or '—'}"))
     else:
-        print(color_ok("[+] No high-confidence vulnerable payloads detected at this threshold."))
+        print(c_ok("[+] No high-confidence vulnerable payloads detected at this threshold."))
 
-    # JSON output (full results)
+    # JSON output
     if args.out:
-        # we produce compact JSON with essential fields; bodies not included by default to keep file sizes reasonable.
         json_out = {
             "meta": {
                 "target": baseline.url,
@@ -685,7 +925,10 @@ def main():
                 "generated_at": int(time.time())
             },
             "baseline": {
-                "url": baseline.url, "status": baseline.status, "body_len": baseline.body_len, "body_md5": baseline.body_md5,
+                "url": baseline.url,
+                "status": baseline.status,
+                "body_len": baseline.body_len,
+                "body_md5": baseline.body_md5,
                 "headers": baseline.headers
             },
             "results": []
@@ -706,15 +949,18 @@ def main():
             })
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(json_out, fh, indent=2)
-        print(color_info(f"[*] JSON report written to {args.out}"))
+        print(c_info(f"[*] JSON report written to {args.out}"))
 
-    # HTML DIFF report - convenient visual output with snippets + diffs
+    # HTML output (new layout)
     if args.html:
         write_html_report(args.html, baseline, results, args.threshold)
-        print(color_info(f"[*] HTML DIFF report written to {args.html}"))
+        print(c_info(f"[*] HTML report written to {args.html}"))
 
-    print(color_head("\nDone."))
+    print(c_head("\nDone."))
 
 
+# ============================================================================
+# Entrypoint
+# ============================================================================
 if __name__ == "__main__":
     main()
