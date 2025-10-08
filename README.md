@@ -170,7 +170,9 @@ optional arguments:
         
     -   If score ≥ --threshold and similarity high, the payload is flagged vulnerable.
         
-    
+
+<video controls src="Screen Recording 2025-10-08 at 12.44.44 PM.mov" title="working sample video"></video>
+
 5.  Save reports (JSON + DIFF HTML).
     
 ### 1. **Cache Priming → Replay → Detection**
