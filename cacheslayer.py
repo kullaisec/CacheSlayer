@@ -52,7 +52,7 @@ The tool can surface sensitive user data; handle the outputs securely.
 
 Author
 ------
-Kullai
+Kullai × ChatGPT
 """
 
 # ============================================================================
@@ -607,6 +607,10 @@ class WCDScanner:
 
         # Attacker phase
         print(c_info(f"    [>] Attacker request (no auth): {payload_url}"))
+        try:
+            self.attacker_session.cookies.clear()
+        except Exception:
+            pass
         ra, ha = do_request(self.attacker_session, "GET", payload_url, headers=self.attacker_headers, verify_ssl=self.verify_ssl)
         if not ra:
             return PayloadResult(payload_url=payload_url, prime_status=prime_status, attacker_status=None, notes=notes)
@@ -615,6 +619,8 @@ class WCDScanner:
         attacker_body = ra.text
         similarity = body_similarity(baseline.body, attacker_body)
         cache_evd = detect_cache_headers(ha)
+        prime_ok = prime_status is not None and 200 <= prime_status < 400
+        body_exact = (attacker_body == baseline.body)
 
         # Heuristic score
         score = 0.6 * similarity
@@ -622,9 +628,24 @@ class WCDScanner:
             score += 0.3
         if ra.status_code == baseline.status:
             score += 0.1
+        if not prime_ok:
+            score = min(score, 0.55)
+        if not cache_evd and not body_exact:
+            score = min(score, 0.58)
         score = min(score, 1.0)
 
-        victim_like = (similarity >= 0.6 and ra.status_code == baseline.status)
+        victim_like = (
+            prime_ok
+            and similarity >= 0.6
+            and ra.status_code == baseline.status
+            and (cache_evd or body_exact)
+        )
+        if not prime_ok:
+            notes.append("prime_not_successful")
+        if not cache_evd:
+            notes.append("no_cache_evidence")
+        if body_exact:
+            notes.append("body_exact_match")
 
         # Snippets + diff for HTML
         v_prev = preview_snippet(baseline.body, length=520, max_lines=18)
