@@ -1,0 +1,27 @@
+# Virtual environment
+cache-venv/
+venv/
+.env/
+
+# Sensitive data
+auth_curl.txt
+*.txt
+
+# Reports and outputs
+report.html
+report.json
+report*.html
+report*.json
+
+# Old/backup files
+web_cache.py
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
