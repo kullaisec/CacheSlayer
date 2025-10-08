@@ -356,14 +356,61 @@ def detect_cache_headers(h: Dict[str, str]) -> List[str]:
     return ev
 
 
-def preview_snippet(text: str, length: int = 360) -> str:
+def preview_snippet(text: str, length: int = 360, max_lines: int = 12) -> str:
     """
-    Return a short, whitespace-normalized, HTML-escaped snippet for preview boxes.
+    Return a short, multi-line, HTML-escaped snippet for preview boxes while keeping the original structure readable.
     """
-    t = re.sub(r"\s+", " ", text).strip()
-    if len(t) > length:
-        t = t[:length] + "…"
-    return html.escape(t, quote=True)
+    if not text:
+        return html.escape("(empty body)")
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+    lines = normalized.split("\n")
+
+    if not lines:
+        compact = re.sub(r"\s+", " ", text).strip()
+        if len(compact) > length:
+            compact = compact[:length].rstrip() + "…"
+        return html.escape(compact, quote=True)
+
+    snippet_lines: List[str] = []
+    remaining = max(length, 0)
+    content_lines = 0
+
+    for raw_line in lines:
+        line = raw_line.strip()
+
+        if not line:
+            if snippet_lines and snippet_lines[-1] == "":
+                continue
+            snippet_lines.append("")
+            continue
+
+        content_lines += 1
+
+        if remaining > 0 and len(line) >= remaining:
+            cutoff = max(remaining - 1, 1)
+            snippet_lines.append(line[:cutoff].rstrip() + "…")
+            remaining = 0
+            break
+
+        snippet_lines.append(line)
+        remaining = max(remaining - len(line), 0)
+
+        if content_lines >= max_lines or remaining <= 0:
+            if snippet_lines:
+                snippet_lines[-1] = snippet_lines[-1].rstrip("…") + "…"
+            break
+
+    snippet = "\n".join(snippet_lines).strip()
+
+    if not snippet:
+        compact = re.sub(r"\s+", " ", text).strip()
+        if len(compact) > length:
+            compact = compact[:length].rstrip() + "…"
+        snippet = compact or "(empty body)"
+
+    return html.escape(snippet, quote=True)
 
 
 def unified_diff_html(a: str, b: str, max_lines: int = 800) -> str:
@@ -580,8 +627,8 @@ class WCDScanner:
         victim_like = (similarity >= 0.6 and ra.status_code == baseline.status)
 
         # Snippets + diff for HTML
-        v_prev = preview_snippet(baseline.body, length=520)
-        a_prev = preview_snippet(attacker_body, length=520)
+        v_prev = preview_snippet(baseline.body, length=520, max_lines=18)
+        a_prev = preview_snippet(attacker_body, length=520, max_lines=18)
         u_diff = unified_diff_html(baseline.body, attacker_body, max_lines=900)
 
         return PayloadResult(
@@ -645,52 +692,278 @@ def write_html_report(path: str, baseline: ResponseRecord, results: List[Payload
     # CSS (dark, clean)
     css = r"""
 :root {
-  --bg: #0b1220;
-  --card: #0a1428;
-  --muted: #9ca3af;
+  --bg: #080f1f;
+  --card: #0b162c;
+  --muted: #94a3b8;
   --text: #e6eef6;
   --accent: #60a5fa;
-  --good: #16a34a;
-  --bad: #dc2626;
-  --warn: #f59e0b;
+  --good: #34d399;
+  --bad: #f87171;
+  --warn: #fbbf24;
   --code: #fbbf24;
-  --line: #1f2937;
+  --line: rgba(148, 163, 184, 0.35);
 }
-*{box-sizing:border-box}
-body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial}
-a{color:var(--accent);text-decoration:none}
-h1,h2{margin:0 0 12px 0}
-.container{padding:20px;max-width:1200px;margin:0 auto}
-.sticky{
-  position:sticky; top:0; z-index:50; backdrop-filter: blur(6px);
-  background: linear-gradient(180deg, rgba(11,18,32,0.95), rgba(11,18,32,0.6));
-  border-bottom:1px solid var(--line);
+* {
+  box-sizing: border-box;
 }
-.header-grid{display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:center;padding:12px 20px}
-h1.title{color:#93c5fd;font-size:20px}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted)}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.kv{margin:6px 0 0 16px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:12px 0}
-.vuln{border-left:4px solid var(--bad)}
-.ok{border-left:4px solid var(--good)}
-table{width:100%;border-collapse:collapse}
-th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
-code{color:var(--code);font-size:0.95em}
-pre{background:#071124;padding:10px;border-radius:8px;overflow:auto;color:var(--text)}
-details{border:1px solid var(--line);border-radius:8px}
-details>summary{cursor:pointer;list-style:none;padding:10px 12px;outline:none}
-details>summary::-webkit-details-marker{display:none}
-summary .status{font-weight:700}
-summary .url{word-break:break-all}
-.fRight{float:right;color:var(--muted);font-size:12px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-input[type="search"]{background:#0e1a33;border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;min-width:260px}
-.btn{background:#0e1a33;border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;cursor:pointer}
-.btn:hover{border-color:#294167}
-.small{font-size:12px;color:var(--muted)}
-.copy{cursor:pointer;border:1px dashed var(--line);padding:2px 6px;border-radius:6px}
+body {
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(circle at top left, rgba(37, 99, 235, 0.12), transparent 55%), var(--bg);
+  color: var(--text);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  line-height: 1.55;
+}
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+h1,
+h2 {
+  margin: 0 0 12px 0;
+}
+.container {
+  padding: 32px 24px 48px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+.sticky {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  backdrop-filter: blur(6px);
+  background: linear-gradient(180deg, rgba(8, 15, 31, 0.95), rgba(8, 15, 31, 0.6));
+  border-bottom: 1px solid var(--line);
+  box-shadow: 0 18px 40px rgba(2, 6, 23, 0.45);
+}
+.header-grid {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 20px;
+  align-items: center;
+  padding: 16px 28px;
+}
+h1.title {
+  color: #bfdbfe;
+  font-size: 22px;
+  font-weight: 600;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: rgba(148, 163, 184, 0.1);
+}
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.row-between {
+  justify-content: space-between;
+  width: 100%;
+}
+.kv {
+  margin: 6px 0 0 16px;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 18px;
+  margin: 16px 0;
+  box-shadow: 0 16px 45px rgba(8, 15, 31, 0.45);
+}
+.card.small {
+  font-size: 12px;
+  color: var(--muted);
+  border-style: dashed;
+}
+.vuln {
+  border-left: 4px solid var(--bad);
+}
+.ok {
+  border-left: 4px solid var(--good);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th,
+td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+code {
+  color: var(--code);
+  font-size: 0.95em;
+}
+pre {
+  background: #071b34;
+  padding: 14px;
+  border-radius: 10px;
+  overflow: auto;
+  color: var(--text);
+  border: 1px solid rgba(96, 165, 250, 0.18);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
+details {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  overflow: hidden;
+  background: rgba(15, 23, 42, 0.4);
+}
+details > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 16px 20px;
+  outline: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(148, 163, 184, 0.08);
+  transition: background 0.2s ease;
+}
+details > summary::-webkit-details-marker {
+  display: none;
+}
+details > summary:hover {
+  background: rgba(96, 165, 250, 0.12);
+}
+details[open] > summary {
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+}
+.summary-main {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.summary-main .status {
+  font-weight: 700;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.12);
+  color: #bfdbfe;
+}
+.summary-main .url {
+  word-break: break-all;
+  padding: 4px 0;
+}
+.summary-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.summary-meta span {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+}
+.payload.vuln summary .status {
+  background: rgba(248, 113, 113, 0.2);
+  color: #fecaca;
+}
+.payload.ok summary .status {
+  background: rgba(52, 211, 153, 0.18);
+  color: #bbf7d0;
+}
+.meta-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 10px 0 12px;
+}
+.meta-row .badge {
+  background: rgba(15, 23, 42, 0.7);
+}
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.grid2 .card {
+  margin: 0;
+  box-shadow: none;
+  border-radius: 12px;
+}
+.filters {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+input[type="search"] {
+  background: #0e1a33;
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 10px;
+  min-width: 260px;
+}
+.small {
+  font-size: 12px;
+  color: var(--muted);
+}
+.copy {
+  cursor: pointer;
+  border: 1px dashed var(--line);
+  padding: 4px 8px;
+  border-radius: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  color: var(--muted);
+  transition: all 0.2s ease;
+}
+.copy:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.copy.copied {
+  border-color: var(--accent);
+  background: rgba(96, 165, 250, 0.16);
+  color: #bfdbfe;
+}
+@media (max-width: 1100px) {
+  .header-grid {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 900px) {
+  .grid2 {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 640px) {
+  .container {
+    padding: 24px 16px 40px;
+  }
+  .summary-main {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  input[type="search"] {
+    min-width: unset;
+    width: 100%;
+  }
+}
 """
 
     # Tiny JS for filtering + copy
@@ -700,7 +973,8 @@ function filterRows() {
   const onlyVuln = document.getElementById('onlyVuln').checked;
   const threshold = parseFloat(document.getElementById('thresholdVal').dataset.th);
   const panels = document.querySelectorAll('.payload');
-  let shown=0;
+  let shown = 0;
+
   panels.forEach(p => {
     const url = p.dataset.url.toLowerCase();
     const score = parseFloat(p.dataset.score);
@@ -711,11 +985,23 @@ function filterRows() {
     p.style.display = ok ? '' : 'none';
     if (ok) shown++;
   });
+
   document.getElementById('shownCount').textContent = shown;
 }
 
-function copyText(txt) {
-  navigator.clipboard.writeText(txt).then(()=>{ alert('Copied!'); });
+function copyText(txt, el) {
+  if (!txt) return;
+  navigator.clipboard.writeText(txt).then(() => {
+    if (!el) return;
+    const original = el.dataset.label || el.textContent;
+    el.dataset.label = original;
+    el.classList.add('copied');
+    el.textContent = 'copied';
+    setTimeout(() => {
+      el.classList.remove('copied');
+      el.textContent = el.dataset.label;
+    }, 1400);
+  }).catch(() => {});
 }
 """
 
@@ -730,18 +1016,28 @@ function copyText(txt) {
 
         # headers
         attk_headers_html = headers_to_html(r.attacker_headers)
+        diff_html = r.unified_diff_html.strip()
+        if not diff_html:
+            diff_html = html.escape("(no diff - bodies match)")
 
         # per-payload panel
         panels_html.append(f"""
 <details class="card payload {klass}" data-url="{html.escape(r.payload_url)}"
          data-score="{r.score:.3f}" data-victimlike="{str(r.victim_like).lower()}" open>
   <summary>
-    <span class="status">{icon} {status}</span>
-    &nbsp; <code class="url">{html.escape(r.payload_url)}</code>
-    <span class="fRight small">score={r.score:.3f} • sim={r.similarity:.3f} • prime={r.prime_status or '-'} • atk={r.attacker_status or '-'}</span>
+    <div class="summary-main">
+      <span class="status">{icon} {status}</span>
+      <code class="url">{html.escape(r.payload_url)}</code>
+    </div>
+    <div class="summary-meta">
+      <span>score {r.score:.3f}</span>
+      <span>sim {r.similarity:.3f}</span>
+      <span>prime {r.prime_status or '-'}</span>
+      <span>atk {r.attacker_status or '-'}</span>
+    </div>
   </summary>
 
-  <div class="row small" style="margin:6px 0 8px 0">
+  <div class="meta-row small">
     <span class="badge">cache: {html.escape(ev)}</span>
     <span class="badge">victim-like: {str(r.victim_like).lower()}</span>
     <span class="badge">md5: {r.attacker_body_md5}</span>
@@ -750,16 +1046,16 @@ function copyText(txt) {
 
   <div class="grid2">
     <div class="card">
-      <div class="row" style="justify-content:space-between;align-items:center">
+      <div class="row row-between">
         <div><b>Victim snippet</b></div>
-        <div class="copy" onclick="copyText(this.parentNode.parentNode.nextElementSibling.textContent)">copy</div>
+        <div class="copy" data-label="copy" onclick="copyText(this.parentNode.parentNode.nextElementSibling.textContent, this)">copy</div>
       </div>
       <pre>{r.preview_victim_snippet}</pre>
     </div>
     <div class="card">
-      <div class="row" style="justify-content:space-between;align-items:center">
+      <div class="row row-between">
         <div><b>Attacker snippet</b></div>
-        <div class="copy" onclick="copyText(this.parentNode.parentNode.nextElementSibling.textContent)">copy</div>
+        <div class="copy" data-label="copy" onclick="copyText(this.parentNode.parentNode.nextElementSibling.textContent, this)">copy</div>
       </div>
       <pre>{r.preview_attacker_snippet}</pre>
     </div>
@@ -772,7 +1068,7 @@ function copyText(txt) {
 
   <div class="card">
     <b>Unified diff (victim → attacker)</b>
-    <pre>{r.unified_diff_html}</pre>
+    <pre>{diff_html}</pre>
   </div>
 </details>
 """)
